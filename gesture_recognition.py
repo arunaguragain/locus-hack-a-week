@@ -1,108 +1,124 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-import math
-from collections import Counter
+from collections import Counter, deque
 
-# Initialize MediaPipe hand tracking
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.5)
+hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.6)
 mp_drawing = mp.solutions.drawing_utils
 
-# Initialize video capture (webcam)
 cap = cv2.VideoCapture(0)
 
-# Function to calculate angle between three points
 def calculate_angle(a, b, c):
-    # Calculate the angle between three points a, b, c using the dot product
     ba = np.array([a[0] - b[0], a[1] - b[1]])
     bc = np.array([c[0] - b[0], c[1] - b[1]])
 
     dot_product = np.dot(ba, bc)
     magnitude_ba = np.linalg.norm(ba)
     magnitude_bc = np.linalg.norm(bc)
-    
-    cosine_angle = dot_product / (magnitude_ba * magnitude_bc)
+
+    cosine_angle = dot_product / (magnitude_ba * magnitude_bc + 1e-6)
+    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
     angle = np.arccos(cosine_angle)
-    
-    return np.degrees(angle)  # Return angle in degrees
+    return np.degrees(angle)
 
-# Gesture Recognition using angle-based features
-def detect_gesture(landmarks):
-    # Extract the angles between key points (thumb, index, etc.)
-    # Example: Calculate angle between thumb, index, and middle fingers
-    
-    thumb_tip = landmarks[4]
-    index_tip = landmarks[8]
-    middle_tip = landmarks[12]
-    
-    # Calculate angles between thumb and index, and index and middle
-    thumb_index_angle = calculate_angle(thumb_tip, landmarks[3], index_tip)
-    index_middle_angle = calculate_angle(index_tip, landmarks[7], middle_tip)
-    
-    # Define threshold values for gesture classification
-    if thumb_index_angle < 50 and index_middle_angle < 50:
-        return "Thumbs Up"
-    elif thumb_index_angle > 140 and index_middle_angle > 140:
-        return "Fist"
-    else:
-        return "Open Hand"
+def finger_extended(landmarks, mcp_idx, pip_idx, dip_idx, tip_idx, threshold=160):
+    mcp = landmarks[mcp_idx]
+    pip = landmarks[pip_idx]
+    dip = landmarks[dip_idx]
+    tip = landmarks[tip_idx]
+    angle = calculate_angle(mcp, pip, dip)
+    return angle > threshold and tip[1] < mcp[1]
 
-# Post-processing with majority voting for gesture smoothing
-def filter_predictions(new_prediction):
-    global gesture_predictions
-    
-    # Append the new prediction to the list
-    gesture_predictions.append(new_prediction)
-    
-    # Keep the last 5 predictions for voting
-    if len(gesture_predictions) > 5:
-        gesture_predictions.pop(0)
-    
-    # Perform majority voting
-    most_common_gesture = Counter(gesture_predictions).most_common(1)[0][0]
-    return most_common_gesture
+def thumb_extended(landmarks, threshold=150):
+    cmc = landmarks[1]
+    mcp = landmarks[2]
+    tip = landmarks[4]
+    angle = calculate_angle(cmc, mcp, tip)
+    return angle > threshold and tip[0] < mcp[0]
 
-# Store previous gesture predictions for post-processing
+def get_finger_states(landmarks):
+    return {
+        "thumb": thumb_extended(landmarks),
+        "index": finger_extended(landmarks, 5, 6, 7, 8),
+        "middle": finger_extended(landmarks, 9, 10, 11, 12),
+        "ring": finger_extended(landmarks, 13, 14, 15, 16),
+        "pinky": finger_extended(landmarks, 17, 18, 19, 20),
+    }
+
 gesture_predictions = []
+wrist_history = deque(maxlen=20)
 
-# Loop through the webcam feed
+def detect_gesture(landmarks):
+    states = get_finger_states(landmarks)
+    extended_count = sum(states.values())
+
+    fist = extended_count == 0
+    open_hand = extended_count >= 4
+
+    waving = False
+    stable = False
+    if len(wrist_history) >= 8:
+        xs = [p[0] for p in wrist_history]
+        spread = max(xs) - min(xs)
+        direction_changes = 0
+        last_dx = 0
+        for i in range(1, len(xs)):
+            dx = xs[i] - xs[i - 1]
+            if abs(dx) < 3:
+                continue
+            if last_dx == 0:
+                last_dx = dx
+                continue
+            if np.sign(dx) != np.sign(last_dx):
+                direction_changes += 1
+                last_dx = dx
+        waving = spread > 90 and direction_changes >= 3
+        stable = spread < 25 and direction_changes == 0
+
+    if fist:
+        return "Yes"
+    if open_hand and waving:
+        return "Hello"
+    if open_hand and not waving and stable:
+        return "Thank You"
+    return "Unknown"
+
+def filter_predictions(new_prediction):
+    gesture_predictions.append(new_prediction)
+    if len(gesture_predictions) > 7:
+        gesture_predictions.pop(0)
+    return Counter(gesture_predictions).most_common(1)[0][0]
+
 while True:
     ret, frame = cap.read()
     if not ret:
         break
-    
-    # Flip the frame for a mirror view
+
     frame = cv2.flip(frame, 1)
 
-    # Convert frame to RGB
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb_frame)
-    
+
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
-            # Get landmark positions
             landmarks = [(lm.x * frame.shape[1], lm.y * frame.shape[0]) for lm in hand_landmarks.landmark]
 
-            # Draw landmarks and connections
+            wrist_history.append(landmarks[0])
+
             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-            
-            # Detect gesture based on landmarks
+
             gesture = detect_gesture(landmarks)
-            
-            # Apply post-processing (majority voting)
             gesture = filter_predictions(gesture)
-            
-            # Display the gesture on screen
+
             cv2.putText(frame, f"Gesture: {gesture}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-    
-    # Show the frame with the detected gestures
+    else:
+        wrist_history.clear()
+
     cv2.imshow("Gesture Recognition", frame)
-    
-    # Exit the loop on pressing 'q'
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Release the webcam and close all OpenCV windows
 cap.release()
 cv2.destroyAllWindows()
